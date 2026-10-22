@@ -4,6 +4,8 @@ guild_id = 123456789012345678
 [printer]
 # `lpstat -p` で表示されるCUPSのプリンター名
 name = "TS6730"
+# 状態取得に使うCUPSの接続先。省略時は /run/cups/cups.sock → localhost:631 の順に自動検出
+# cups_server = "/run/cups/cups.sock"
 # カラー/モノクロ指定に使う lp の -o オプション。
 # ドライバによって名前が違うので `lpoptions -p TS6730 -l` で確認して書き換える
 color_options = ["print-color-mode=color"]

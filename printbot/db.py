@@ -64,7 +64,7 @@ class Database:
     def sheets_today(self, user_id: int) -> int:
         row = self._conn.execute(
             "SELECT COALESCE(SUM(sheets), 0) FROM jobs WHERE user_id = ?"
-            " AND date(created_at) = date('now', 'localtime') AND status != 'canceled'",
+            " AND date(created_at) = date('now', 'localtime') AND status NOT IN ('canceled', 'failed')",
             (user_id,),
         ).fetchone()
         return int(row[0])

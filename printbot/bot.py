@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -10,14 +11,20 @@ from discord import app_commands
 
 from .config import Config
 from .db import Database, JobRecord
+from .ipp import (
+    JOB_ABORTED, JOB_CANCELED, JOB_PENDING, JOB_STOPPED,
+    IppClient, IppError, IppNotFound, JobStatus, PrinterStatus,
+)
 from .pdf_utils import PdfError, inspect_pdf, parse_page_ranges, render_preview
-from .printing import Cups, PrintError
+from .printing import Cups, PrintError, job_number
 
 log = logging.getLogger(__name__)
 
-POLL_INTERVAL_SEC = 5
+POLL_INTERVAL_SEC = 3
 STALL_NOTICE_SEC = 90
 MAX_WATCH_SEC = 24 * 60 * 60
+# Interaction tokens expire after 15 minutes; stop editing the ephemeral panel a bit before.
+PANEL_TTL_SEC = 14 * 60
 
 COLOR_CHOICES = [
     app_commands.Choice(name="モノクロ", value="mono"),
@@ -87,6 +94,7 @@ class PrintBot(discord.Client):
         self.config = config
         self.tree = GuardedTree(self)
         self.cups = Cups(config.printer, config.extra_options)
+        self.ipp = IppClient(config.printer, config.cups_server)
         self.db = Database(config.db_path)
         # Serializes the "check daily limit -> submit -> record" sequence.
         self.submit_lock = asyncio.Lock()
@@ -125,53 +133,161 @@ class PrintBot(discord.Client):
         await super().close()
         self.db.close()
 
+    async def printer_status(self) -> Optional[PrinterStatus]:
+        try:
+            return await self.ipp.printer_status()
+        except IppError as e:
+            log.warning("printer status unavailable: %s", e)
+            return None
+
     # --- job watching -----------------------------------------------------
 
-    def watch(self, rec: JobRecord) -> None:
-        task = asyncio.create_task(self._watch(rec))
+    def watch(self, rec: JobRecord, panel: Optional[discord.Interaction] = None) -> None:
+        task = asyncio.create_task(self._watch(rec, panel))
         self._watchers.add(task)
         task.add_done_callback(self._watchers.discard)
 
-    async def _watch(self, rec: JobRecord) -> None:
-        waited = 0
+    async def _watch(self, rec: JobRecord, panel: Optional[discord.Interaction] = None) -> None:
+        """Poll the job over IPP, keep the requester's ephemeral panel updated, report the result."""
+        started = time.monotonic()
+        last_shown = None
         stall_notified = False
-        while waited < MAX_WATCH_SEC:
-            await asyncio.sleep(POLL_INTERVAL_SEC)
-            waited += POLL_INTERVAL_SEC
+        while time.monotonic() - started < MAX_WATCH_SEC:
+            elapsed = time.monotonic() - started
             try:
-                active = await self.cups.is_active(rec.cups_job_id)
-            except PrintError as e:
-                log.warning("lpstat failed while watching %s: %s", rec.cups_job_id, e)
+                status: Optional[JobStatus] = await self.ipp.job_status(job_number(rec.cups_job_id))
+            except IppNotFound:
+                status = None  # job history already purged by CUPS
+            except IppError as e:
+                log.warning("cannot read state of %s: %s", rec.cups_job_id, e)
+                await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
-            if not active:
-                # /cancel already set the status, in which case we stay quiet.
-                if self.db.set_status(rec.cups_job_id, "done"):
-                    await self.notify(rec, f"✅ 印刷が完了しました: `{rec.file_name}`（{rec.sheets}枚）")
+
+            printer = None
+            if status is None or status.final or status.state in (JOB_PENDING, JOB_STOPPED):
+                printer = await self.printer_status()
+
+            shown = (status, printer.problems() if printer else None)
+            if panel and shown != last_shown and elapsed < PANEL_TTL_SEC:
+                last_shown = shown
+                await self._update_panel(panel, rec, status, printer)
+
+            if status is None or status.final:
+                await self._finish(rec, status, printer)
                 return
-            if not stall_notified and waited >= STALL_NOTICE_SEC:
+
+            if not stall_notified and elapsed >= STALL_NOTICE_SEC and (
+                status.state in (JOB_PENDING, JOB_STOPPED) or (printer and printer.problems())
+            ):
                 stall_notified = True
-                _, status = await self.cups.status()
+                problems = "、".join(printer.problems()) if printer and printer.problems() else ""
                 await self.notify(
                     rec,
-                    f"⚠️ `{rec.file_name}` がまだ印刷待ちです。プリンターの電源・用紙・インクを確認してください。\n"
-                    f"```\n{status[:1500]}\n```",
+                    f"⚠️ `{rec.file_name}` がまだ印刷されていません（{status.label}）。"
+                    + (f"\nプリンター: **{problems}**" if problems else
+                       "\nプリンターの電源・用紙・インクを確認してください。"),
+                    f"⚠️ 印刷ジョブ `{rec.cups_job_id}` がまだ印刷されていません。プリンターを確認してください。",
                 )
+            await asyncio.sleep(POLL_INTERVAL_SEC)
         log.warning("gave up watching %s", rec.cups_job_id)
 
-    async def notify(self, rec: JobRecord, text: str) -> None:
-        mention = discord.AllowedMentions(users=[discord.Object(rec.user_id)])
+    async def _update_panel(self, panel: discord.Interaction, rec: JobRecord,
+                            status: Optional[JobStatus], printer: Optional[PrinterStatus]) -> None:
         try:
-            if rec.channel_id:
-                channel = self.get_channel(rec.channel_id) or await self.fetch_channel(rec.channel_id)
-                await channel.send(f"<@{rec.user_id}> {text}", allowed_mentions=mention)
-                return
+            await panel.edit_original_response(content=format_panel(rec, status, printer))
         except discord.HTTPException as e:
-            log.warning("channel notify failed, falling back to DM: %s", e)
+            log.info("could not update status panel: %s", e)
+
+    async def _finish(self, rec: JobRecord, status: Optional[JobStatus],
+                      printer: Optional[PrinterStatus]) -> None:
+        if status is None:
+            self.db.set_status(rec.cups_job_id, "done")
+            await self.notify(
+                rec,
+                f"✅ 印刷が完了しました: `{rec.file_name}`（{rec.sheets}枚）\n"
+                "※ 詳細な結果はCUPSの履歴から取得できませんでした",
+                f"✅ 印刷ジョブ `{rec.cups_job_id}` が完了しました。",
+            )
+        elif status.succeeded:
+            self.db.set_status(rec.cups_job_id, "done")
+            await self.notify(
+                rec,
+                f"✅ 印刷が完了しました: `{rec.file_name}`（{rec.sheets}枚）",
+                f"✅ 印刷ジョブ `{rec.cups_job_id}` が完了しました。",
+            )
+        elif status.state == JOB_CANCELED:
+            # /cancel by the owner already marked it; otherwise an admin or CUPS canceled it.
+            if self.db.set_status(rec.cups_job_id, "canceled"):
+                await self.notify(
+                    rec,
+                    f"🗑️ `{rec.file_name}` の印刷は取り消されました。",
+                    f"🗑️ 印刷ジョブ `{rec.cups_job_id}` は取り消されました。",
+                )
+        else:  # aborted or completed with errors
+            self.db.set_status(rec.cups_job_id, "failed" if status.state == JOB_ABORTED else "done")
+            reason = failure_reason(status, printer)
+            await self.notify(
+                rec,
+                f"{status.label}: `{rec.file_name}`" + (f"\n理由: {reason}" if reason else ""),
+                f"{status.label}: 印刷ジョブ `{rec.cups_job_id}`（詳細はDMを有効にすると届きます）",
+            )
+        log.info("job %s finished: %s", rec.cups_job_id, status.label if status else "unknown")
+
+    async def notify(self, rec: JobRecord, private_text: str, public_text: str) -> None:
+        """DM the requester. If DMs are closed, post a mention without the file name instead."""
         try:
             user = self.get_user(rec.user_id) or await self.fetch_user(rec.user_id)
-            await user.send(text)
+            await user.send(private_text)
+            return
+        except discord.HTTPException as e:
+            log.info("DM to %s failed (%s); falling back to channel", rec.user_id, e)
+        if not rec.channel_id:
+            return
+        try:
+            channel = self.get_channel(rec.channel_id) or await self.fetch_channel(rec.channel_id)
+            await channel.send(
+                f"<@{rec.user_id}> {public_text}",
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(rec.user_id)]),
+            )
         except discord.HTTPException as e:
             log.warning("could not notify user %s: %s", rec.user_id, e)
+
+
+def failure_reason(status: JobStatus, printer: Optional[PrinterStatus]) -> str:
+    parts = []
+    if printer and printer.problems():
+        parts.append("、".join(printer.problems()))
+    if status.message:
+        parts.append(status.message)
+    return " / ".join(parts)
+
+
+def format_panel(rec: JobRecord, status: Optional[JobStatus], printer: Optional[PrinterStatus]) -> str:
+    label = status.label if status else "✅ 印刷完了"
+    lines = [
+        f"🖨️ **{rec.file_name}**（ジョブ `{rec.cups_job_id}` / {rec.sheets}枚）",
+        f"状態: **{label}**",
+    ]
+    if status and status.message:
+        lines.append(f"詳細: {status.message}")
+    if printer and printer.problems():
+        lines.append(f"プリンター: ⚠️ {'、'.join(printer.problems())}")
+    if status is None or not status.final:
+        lines.append(f"最終更新: <t:{int(time.time())}:T>（結果はDMでもお知らせします）")
+    return "\n".join(lines)
+
+
+def format_printer(printer: PrinterStatus) -> str:
+    lines = [f"**{printer.label}**" + ("" if printer.accepting else "（ジョブ受付停止中）")]
+    if printer.problems():
+        lines.append("⚠️ " + "、".join(printer.problems()))
+    if printer.message:
+        lines.append(f"メッセージ: {printer.message}")
+    for m in printer.markers:
+        if m.level >= 0:
+            filled = round(m.level / 10)
+            lines.append(f"`{'█' * filled}{'░' * (10 - filled)}` {m.level:3d}%  {m.name}")
+    return "\n".join(lines)
 
 
 def _register_commands(bot: PrintBot) -> None:
@@ -226,7 +342,7 @@ def _register_commands(bot: PrintBot) -> None:
 
             first_page = int(re.match(r"\d+", selection.cups_ranges).group()) if selection.cups_ranges else 1
             preview = await render_preview(pdf_path, first_page, png_path)
-            usable, _ = await bot.cups.status()
+            printer = await bot.printer_status()
 
             lines = [
                 f"**{_safe_title(file.filename)}** を印刷しますか？",
@@ -234,8 +350,11 @@ def _register_commands(bot: PrintBot) -> None:
                 f"・部数: {copies}　→ 合計 **{sheets}枚**（片面）",
                 f"・{'カラー' if is_color else 'モノクロ'}",
             ]
-            if not usable:
-                lines.append("⚠️ プリンターが停止中です。印刷はプリンター復帰後になります。")
+            if printer is None:
+                lines.append("⚠️ プリンターの状態を取得できませんでした。")
+            elif not printer.usable or printer.problems():
+                problems = "、".join(printer.problems()) or "停止中"
+                lines.append(f"⚠️ プリンター: {problems}。印刷はプリンター復帰後になります。")
             view = ConfirmView(interaction.user.id, timeout=cfg.confirm_timeout_sec)
             attachments = [discord.File(preview, filename="preview.png")] if preview else []
             await interaction.edit_original_response(
@@ -272,11 +391,11 @@ def _register_commands(bot: PrintBot) -> None:
                     copies=copies, color=is_color,
                 )
             log.info("job %s submitted by %s (%d sheets)", job_id, interaction.user, sheets)
-            await interaction.edit_original_response(
-                content=f"🖨️ 印刷キューに追加しました（ジョブID: `{job_id}`）。完了したらお知らせします。")
             rec = bot.db.get(job_id)
             if rec:
-                bot.watch(rec)
+                await interaction.edit_original_response(
+                    content=format_panel(rec, JobStatus(JOB_PENDING), None))
+                bot.watch(rec, panel=interaction)
         finally:
             # lp has already sent the data to cupsd, so the local copy can go.
             pdf_path.unlink(missing_ok=True)
@@ -295,8 +414,17 @@ def _register_commands(bot: PrintBot) -> None:
         lines = []
         for j in jobs:
             rec = bot.db.get(j.job_id)
-            who = f"<@{rec.user_id}> `{rec.file_name}`（{rec.sheets}枚）" if rec else "（Bot外のジョブ）"
-            lines.append(f"・`{j.job_id}` {who}")
+            try:
+                state = (await bot.ipp.job_status(job_number(j.job_id))).label
+            except IppError:
+                state = "状態不明"
+            if rec and rec.user_id == interaction.user.id:
+                who = f"あなた `{rec.file_name}`（{rec.sheets}枚）"
+            elif rec:
+                who = f"他のメンバー（{rec.sheets}枚）"  # file names stay private
+            else:
+                who = "Bot外のジョブ"
+            lines.append(f"・`{j.job_id}` {state} — {who}")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @tree.command(name="cancel", description="印刷ジョブを取り消します", guild=guild)
@@ -317,12 +445,13 @@ def _register_commands(bot: PrintBot) -> None:
         except PrintError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
-        bot.db.set_status(job_id, "canceled")
+        if rec and rec.user_id == member.id:
+            bot.db.set_status(job_id, "canceled")  # owner already knows; keep the watcher quiet
         await interaction.response.send_message(f"🗑️ `{job_id}` を取り消しました。", ephemeral=True)
 
     @tree.command(name="status", description="プリンターの状態を表示します", guild=guild)
     async def status_cmd(interaction: discord.Interaction):
-        usable, text = await bot.cups.status()
+        printer = await bot.printer_status()
         try:
             queued = len(await bot.cups.active_jobs())
         except PrintError:
@@ -330,9 +459,9 @@ def _register_commands(bot: PrintBot) -> None:
         used = bot.db.sheets_today(interaction.user.id)
         limit = cfg.daily_sheets_per_user
         quota = f"{used} / {limit}枚" if limit > 0 else f"{used}枚（上限なし）"
+        body = format_printer(printer) if printer else "🔴 プリンターの状態を取得できませんでした（CUPSを確認してください）"
         await interaction.response.send_message(
-            f"{'🟢 利用可能' if usable else '🔴 停止中'}　印刷待ち: {queued}件　本日のあなたの利用: {quota}\n"
-            f"```\n{text[:1500]}\n```",
+            f"🖨️ **{cfg.printer}**\n{body}\n印刷待ち: {queued}件　本日のあなたの利用: {quota}",
             ephemeral=True,
         )
 

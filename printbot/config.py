@@ -20,6 +20,7 @@ class Config:
     token: str
     guild_id: int
     printer: str
+    cups_server: str | None
     color_options: tuple[str, ...]
     mono_options: tuple[str, ...]
     extra_options: tuple[str, ...]
@@ -70,6 +71,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             token=token,
             guild_id=int(raw["guild_id"]),
             printer=str(printer["name"]),
+            cups_server=printer.get("cups_server") or None,
             color_options=tuple(printer.get("color_options", ["print-color-mode=color"])),
             mono_options=tuple(printer.get("mono_options", ["print-color-mode=monochrome"])),
             extra_options=tuple(printer.get("extra_options", [])),

@@ -14,6 +14,11 @@ class PrintError(Exception):
     pass
 
 
+def job_number(job_id: str) -> int:
+    """"TS6730-12" -> 12"""
+    return int(job_id.rsplit("-", 1)[-1])
+
+
 @dataclass(frozen=True)
 class QueuedJob:
     job_id: str
@@ -90,13 +95,3 @@ class Cups:
         code, out, err = await _run("cancel", job_id)
         if code != 0:
             raise PrintError(f"取り消しに失敗しました: {(err or out).strip()}")
-
-    async def status(self) -> tuple[bool, str]:
-        """Return (usable, human readable status) for the printer."""
-        code, out, err = await _run("lpstat", "-l", "-p", self.printer)
-        if code != 0:
-            return False, (err or out).strip() or "プリンターが見つかりません"
-        text = out.strip()
-        first = text.splitlines()[0] if text else ""
-        usable = "disabled" not in first and "not accepting" not in text
-        return usable, text
