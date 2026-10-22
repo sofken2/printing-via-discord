@@ -1,0 +1,27 @@
+[Unit]
+Description=Discord print bot
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=printbot
+Group=printbot
+WorkingDirectory=/opt/printbot
+EnvironmentFile=/etc/printbot/printbot.env
+Environment=PRINTBOT_CONFIG=/etc/printbot/config.toml
+ExecStart=/opt/printbot/.venv/bin/python -m printbot
+Restart=always
+RestartSec=5
+StateDirectory=printbot
+StateDirectoryMode=0700
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
