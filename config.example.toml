@@ -1,0 +1,30 @@
+# BotをインストールするDiscordサーバーのID（このサーバー以外では動作しない）
+guild_id = 123456789012345678
+
+[printer]
+# `lpstat -p` で表示されるCUPSのプリンター名
+name = "TS6730"
+# カラー/モノクロ指定に使う lp の -o オプション。
+# ドライバによって名前が違うので `lpoptions -p TS6730 -l` で確認して書き換える
+color_options = ["print-color-mode=color"]
+mono_options = ["print-color-mode=monochrome"]
+# 全ジョブ共通で付ける -o オプション
+extra_options = ["media=A4", "fit-to-page"]
+
+[limits]
+max_file_mb = 10          # 添付ファイルの最大サイズ
+max_pages = 30            # 1ジョブで印刷できる最大ページ数（ページ範囲指定後、1部あたり）
+max_copies = 5            # 最大部数
+daily_sheets_per_user = 50  # 1人1日あたりの最大枚数（0で無制限）
+confirm_timeout_sec = 60  # 確認ボタンの有効時間
+cooldown_sec = 10         # /print の連打防止
+
+[access]
+# 空なら全メンバーが利用可。IDを入れるとそのロール保持者のみ利用可
+allowed_role_ids = []
+# 他人のジョブを取り消せるロール（「サーバー管理」権限保持者は常に可）
+admin_role_ids = []
+
+[paths]
+db = "/var/lib/printbot/printbot.db"
+work_dir = "/var/lib/printbot/tmp"

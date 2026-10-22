@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printbot"
+version = "0.1.0"
+description = "Discord bot that prints PDFs on a CUPS printer"
+requires-python = ">=3.10"
+dependencies = [
+    "discord.py>=2.4,<3",
+    "pypdf[crypto]>=4.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["printbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
