@@ -1,0 +1,3 @@
+#!/bin/sh
+# 異常終了時の連続再起動を防ぐ（systemd の RestartSec=5 相当）
+[ "$1" = 0 ] || sleep 5

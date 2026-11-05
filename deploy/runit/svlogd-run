@@ -1,0 +1,7 @@
+#!/bin/sh
+# /etc/sv/svlogd/run が無い環境用のログサービス。ログは /var/log/runit/<サービス名>/current
+exec 2>&1
+SERVICE=$(basename "$(dirname "$PWD")")
+LOGDIR=/var/log/runit/$SERVICE
+install -d -m 0750 "$LOGDIR"
+exec svlogd -tt "$LOGDIR"

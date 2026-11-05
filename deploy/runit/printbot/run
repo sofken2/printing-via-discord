@@ -1,0 +1,21 @@
+#!/bin/sh
+# runit 用 printbot サービス（antiX など systemd のない環境向け）
+exec 2>&1
+
+ENV_FILE=/etc/printbot/printbot.env
+[ -r "$ENV_FILE" ] || { echo "$ENV_FILE がありません"; exit 1; }
+
+# systemd の EnvironmentFile 相当（KEY=VALUE 形式のみ読む）
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*) continue ;; *=*) ;; *) continue ;; esac
+  key=${line%%=*}; value=${line#*=}
+  value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
+  export "$key=$value"
+done < "$ENV_FILE"
+export PRINTBOT_CONFIG=/etc/printbot/config.toml
+
+# systemd の StateDirectory 相当
+install -d -m 0700 -o printbot -g printbot /var/lib/printbot
+
+cd /opt/printbot || exit 1
+exec chpst -u printbot:printbot /opt/printbot/.venv/bin/python -m printbot

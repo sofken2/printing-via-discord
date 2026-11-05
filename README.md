@@ -2,7 +2,9 @@
 
 Discord に PDF を送るだけで、サーバー PC に USB 接続したプリンターから印刷できる常駐 Bot です。
 
-- 対象環境: Linux Mint（Ubuntu 系）/ CUPS / Canon TS6730（USB、片面・カラー対応）
+- 対象環境: Debian 系 Linux / CUPS / Canon TS6730（USB、片面・カラー対応）
+  - 稼働中のサーバー: **antiX 26.1（Debian 13 trixie ベース、init は runit）**
+  - systemd 環境（Linux Mint / Ubuntu など）でも動きます。`install.sh` が init を自動判定します
 - 実装: Python 3.10+ / discord.py / pypdf / CUPS (`lp`)
 
 ## 機能
@@ -28,7 +30,7 @@ Discord に PDF を送るだけで、サーバー PC に USB 接続したプリ�
 - 用紙切れ・インク切れ・カバー開き・オフラインなど、プリンターが報告した問題も表示します
 - **印刷の成功・失敗は DM で通知**します。失敗した場合は理由も送ります。90 秒以上印刷が進まない場合も DM で知らせます
 - Bot を再起動しても、印刷待ちジョブの監視を再開します
-- `/status` では、プリンターの状態、エラー、インク残量（ドライバが報告する場合）を表示します
+- `/status` では、プリンターの状態、エラー（ある場合のみ）、印刷待ち件数、本日の自分の利用枚数を表示します
 
 > 「印刷完了」は、CUPS がプリンターへのデータ送信を終えた時点を指します。紙が実際に出てきたかまでは検知できません。プリンター本体のエラー（紙詰まりなど）は、ドライバが報告したものだけ表示されます。
 
@@ -61,13 +63,21 @@ lpinfo -v
 
 次のいずれかの方法で登録します（上から順に試してください）。
 
-**A. ドライバなし（IPP-over-USB）**
+**A. ドライバなし（IPP-over-USB）— 推奨。TS6730 は対応済み（USB インターフェース 7/1/4）**
 
 ```bash
 sudo apt install ipp-usb
-systemctl status ipp-usb
-lpinfo -v | grep -i ipp       # ipp://localhost:60000/... が出れば対応
-sudo lpadmin -p TS6730 -E -v "<上で出た ipp:// の URI>" -m everywhere
+sudo ipp-usb check            # "Canon TS6730 series" が出れば対応
+```
+
+ipp-usb は udev ルールから **systemd 経由で**起動される作りのため、runit の antiX では自動では起動しません。
+`sudo ./deploy/install.sh`（手順 4）を実行すると runit サービス `/etc/sv/ipp-usb` が登録・有効化されます。先に手動で試す場合は次のとおりです。
+
+```bash
+sudo sv status ipp-usb        # runit（antiX）: run: ipp-usb ... なら起動中
+systemctl status ipp-usb      # systemd 環境の場合
+ipptool -tv ipp://localhost:60000/ipp/print get-printer-attributes.test | head   # 応答があれば OK
+sudo lpadmin -p TS6730 -E -v ipp://localhost:60000/ipp/print -m everywhere
 ```
 
 **B. Canon 純正ドライバ（cnijfilter2）**
@@ -107,9 +117,14 @@ PreserveJobFiles No
 設定したら次を実行します。
 
 ```bash
+# runit（antiX）
+sudo sv restart cups
+# systemd 環境
 sudo systemctl restart cups
 sudo systemctl disable --now cups-browsed   # 使わないなら停止（過去に脆弱性あり）
 ```
+
+> antiX の既定の `cupsd.conf` は `Browsing Yes` になっているので `No` に変更してください。cups-browsed は antiX 26.1 では未インストールです。
 
 ### 3. Discord Bot を作成する
 
@@ -121,23 +136,33 @@ sudo systemctl disable --now cups-browsed   # 使わないなら停止（過去�
 ### 4. インストールと常駐化
 
 ```bash
-git clone https://github.com/Tatsubooom/printing-via-discord.git
+git clone https://github.com/sofken2/printing-via-discord.git
 cd printing-via-discord
 sudo ./deploy/install.sh
 
 sudo nano /etc/printbot/printbot.env   # DISCORD_TOKEN=...
 sudo nano /etc/printbot/config.toml    # guild_id, printer.name など
-sudo systemctl enable --now printbot
-journalctl -u printbot -f
 ```
 
-インストールすると、Bot は専用ユーザー `printbot` で動き、OS 起動時に自動起動し、異常終了しても 5 秒後に再起動します。
+起動とログ確認は init によって異なります（`install.sh` の最後にも表示されます）。
 
-更新するときは、`git pull` のあとにもう一度 `sudo ./deploy/install.sh` と `sudo systemctl restart printbot` を実行します。
+| | runit（antiX） | systemd（Mint / Ubuntu） |
+|---|---|---|
+| 有効化・起動 | `sudo ln -s /etc/sv/printbot /etc/service/printbot` | `sudo systemctl enable --now printbot` |
+| 状態 | `sudo sv status printbot` | `systemctl status printbot` |
+| 再起動 | `sudo sv restart printbot` | `sudo systemctl restart printbot` |
+| 停止（無効化） | `sudo rm /etc/service/printbot` | `sudo systemctl disable --now printbot` |
+| ログ | `sudo tail -f /var/log/runit/printbot/current` | `journalctl -u printbot -f` |
+
+インストールすると、Bot は専用ユーザー `printbot` で動き、OS 起動時に自動起動し、異常終了しても 5 秒後に再起動します。
+runit 環境では ipp-usb もサービス化され（`/etc/sv/ipp-usb`）、自動で起動します。
+
+更新するときは、`git pull` のあとにもう一度 `sudo ./deploy/install.sh` を実行し、上の表の「再起動」を実行します。
 
 ## 開発
 
 ```bash
+sudo apt install python3-venv   # antiX では未インストールのことがある
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
@@ -153,8 +178,10 @@ cp .env.example .env
 |---|---|
 | コマンドが表示されない | `guild_id` が正しいか、招待時に `applications.commands` を付けたか |
 | 「まだ印刷されていません」の通知が来る | プリンターの電源、用紙、インク。`lpstat -l -p TS6730` の出力 |
+| `/opt/printbot/.venv` が作れない（`ensurepip` がない） | `sudo apt install python3-venv` |
 | 完了通知が DM で届かない | Discord の「サーバーにいるメンバーからのダイレクトメッセージを許可する」が ON になっているか |
-| 状態が「取得できませんでした」になる | CUPS が動いているか（`systemctl status cups`）。`config.toml` の `cups_server` |
-| プリンターが停止中になる | `sudo cupsenable TS6730` で再開。`journalctl -u cups` も確認 |
+| 状態が「取得できませんでした」になる | CUPS が動いているか（`sudo sv status cups` / `systemctl status cups`）。`config.toml` の `cups_server` |
+| プリンターが見つからない（`ipp://localhost:60000` に繋がらない） | ipp-usb が動いているか（`sudo sv status ipp-usb`）。ログは `/var/log/ipp-usb/` |
+| プリンターが停止中になる | `sudo cupsenable TS6730` で再開。`/var/log/cups/error_log`（systemd なら `journalctl -u cups`）も確認 |
 | モノクロにならない | `lpoptions -p TS6730 -l` を見て `mono_options` を直す |
 | プレビューが出ない | `sudo apt install poppler-utils` |

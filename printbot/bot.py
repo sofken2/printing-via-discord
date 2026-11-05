@@ -283,10 +283,6 @@ def format_printer(printer: PrinterStatus) -> str:
         lines.append("⚠️ " + "、".join(printer.problems()))
     if printer.message:
         lines.append(f"メッセージ: {printer.message}")
-    for m in printer.markers:
-        if m.level >= 0:
-            filled = round(m.level / 10)
-            lines.append(f"`{'█' * filled}{'░' * (10 - filled)}` {m.level:3d}%  {m.name}")
     return "\n".join(lines)
 
 
@@ -461,7 +457,7 @@ def _register_commands(bot: PrintBot) -> None:
         quota = f"{used} / {limit}枚" if limit > 0 else f"{used}枚（上限なし）"
         body = format_printer(printer) if printer else "🔴 プリンターの状態を取得できませんでした（CUPSを確認してください）"
         await interaction.response.send_message(
-            f"🖨️ **{cfg.printer}**\n{body}\n印刷待ち: {queued}件　本日のあなたの利用: {quota}",
+            f"{body}\n印刷待ち: {queued}件　本日のあなたの利用: {quota}",
             ephemeral=True,
         )
 
