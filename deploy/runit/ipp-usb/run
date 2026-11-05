@@ -1,0 +1,5 @@
+#!/bin/sh
+# IPP-over-USB デーモン。systemd 環境では udev ルールから起動されるが、
+# runit 環境では起動されないので常駐サービスとして動かす。
+exec 2>&1
+exec /usr/sbin/ipp-usb standalone
