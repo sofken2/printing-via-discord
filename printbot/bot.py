@@ -28,11 +28,6 @@ MAX_WATCH_SEC = 24 * 60 * 60
 # Interaction tokens expire after 15 minutes; stop editing the ephemeral panel a bit before.
 PANEL_TTL_SEC = 14 * 60
 
-COLOR_CHOICES = [
-    app_commands.Choice(name="モノクロ", value="mono"),
-    app_commands.Choice(name="カラー", value="color"),
-]
-
 
 HELP_COOLDOWN_SEC = 30
 
@@ -503,19 +498,12 @@ def _register_commands(bot: PrintBot) -> None:
 
     @tree.command(name="print", description="PDF・画像・Office文書などを印刷します", guild=guild)
     @app_commands.describe(
-        file="印刷するファイル（PDF、画像、Word/Excel/PowerPoint、テキストなど）",
-        copies=f"部数（1〜{cfg.max_copies}）",
-        pages="ページ範囲（例: 1-3,5）。省略で全ページ",
-        color="カラー/モノクロ（省略でモノクロ）",
+        file="印刷するファイル（PDF・画像・Office文書など）。部数・色・ページは送信後のボタンで選べます",
     )
-    @app_commands.choices(color=COLOR_CHOICES)
     @app_commands.checks.cooldown(1, cfg.cooldown_sec, key=lambda i: i.user.id)
     async def print_cmd(
         interaction: discord.Interaction,
         file: discord.Attachment,
-        copies: app_commands.Range[int, 1, cfg.max_copies] = 1,
-        pages: Optional[str] = None,
-        color: Optional[app_commands.Choice[str]] = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if file.size > cfg.max_file_bytes:
@@ -545,11 +533,8 @@ def _register_commands(bot: PrintBot) -> None:
                 await interaction.edit_original_response(content=f"❌ {e}")
                 return
 
-            # The command options only set the starting values; everything can be changed with buttons.
-            setup = PrintSetup(total=total, max_pages=cfg.max_pages, copies=copies,
-                               color=color is not None and color.value == "color")
-            if pages:
-                setup.set_pages(pages)
+            # Copies, colour and pages are chosen with the buttons on the confirmation screen.
+            setup = PrintSetup(total=total, max_pages=cfg.max_pages, copies=1, color=False)
 
             printer = await bot.printer_status()
             printer_note = None
