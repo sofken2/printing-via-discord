@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -10,6 +11,7 @@ import discord
 from discord import app_commands
 
 from .config import Config
+from .convert import ConvertError, detect_kind, to_pdf
 from .db import Database, JobRecord
 from .ipp import (
     JOB_ABORTED, JOB_CANCELED, JOB_PENDING, JOB_STOPPED,
@@ -291,9 +293,9 @@ def _register_commands(bot: PrintBot) -> None:
     guild = discord.Object(cfg.guild_id)
     tree = bot.tree
 
-    @tree.command(name="print", description="PDFをプリンターで印刷します", guild=guild)
+    @tree.command(name="print", description="PDF・画像・Office文書などを印刷します", guild=guild)
     @app_commands.describe(
-        file="印刷するPDFファイル",
+        file="印刷するファイル（PDF、画像、Word/Excel/PowerPoint、テキストなど）",
         copies=f"部数（1〜{cfg.max_copies}）",
         pages="ページ範囲（例: 1-3,5）。省略で全ページ",
         color="カラー/モノクロ（省略でモノクロ）",
@@ -313,27 +315,39 @@ def _register_commands(bot: PrintBot) -> None:
                 f"ファイルが大きすぎます（上限 {cfg.max_file_bytes // 1024 // 1024}MB）。", ephemeral=True)
             return
 
+        try:
+            kind = detect_kind(file.filename)  # reject unsupported types before downloading
+        except ConvertError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
         is_color = color is not None and color.value == "color"
         work = cfg.work_dir / uuid.uuid4().hex
-        pdf_path, png_path = work.with_suffix(".pdf"), work.with_suffix(".png")
+        work.mkdir(mode=0o700)
+        png_path = work / "preview.png"
         try:
-            await file.save(pdf_path)
+            src = work / "upload"
+            await file.save(src)
             try:
+                if kind != "pdf":
+                    await interaction.edit_original_response(content="🔄 PDFに変換しています…")
+                converted = await to_pdf(src, file.filename, work, cfg.work_dir / ".libreoffice")
+                pdf_path = converted.pdf
                 total = await asyncio.to_thread(inspect_pdf, pdf_path)
                 selection = parse_page_ranges(pages, total)
             except PdfError as e:
-                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+                await interaction.edit_original_response(content=f"❌ {e}")
                 return
             if selection.count > cfg.max_pages:
-                await interaction.followup.send(
+                await interaction.edit_original_response(content=
                     f"❌ ページ数が多すぎます（{selection.count}ページ / 上限 {cfg.max_pages}ページ）。"
-                    "ページ範囲を指定してください。", ephemeral=True)
+                    "ページ範囲を指定してください。")
                 return
 
             sheets = selection.count * copies
             limit_msg = _check_daily_limit(bot, interaction.user.id, sheets)
             if limit_msg:
-                await interaction.followup.send(limit_msg, ephemeral=True)
+                await interaction.edit_original_response(content=limit_msg)
                 return
 
             first_page = int(re.match(r"\d+", selection.cups_ranges).group()) if selection.cups_ranges else 1
@@ -393,9 +407,8 @@ def _register_commands(bot: PrintBot) -> None:
                     content=format_panel(rec, JobStatus(JOB_PENDING), None))
                 bot.watch(rec, panel=interaction)
         finally:
-            # lp has already sent the data to cupsd, so the local copy can go.
-            pdf_path.unlink(missing_ok=True)
-            png_path.unlink(missing_ok=True)
+            # lp has already sent the data to cupsd, so the local copies can go.
+            shutil.rmtree(work, ignore_errors=True)
 
     @tree.command(name="queue", description="印刷待ちのジョブ一覧を表示します", guild=guild)
     async def queue_cmd(interaction: discord.Interaction):
