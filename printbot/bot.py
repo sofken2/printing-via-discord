@@ -283,10 +283,6 @@ def format_printer(printer: PrinterStatus) -> str:
         lines.append("⚠️ " + "、".join(printer.problems()))
     if printer.message:
         lines.append(f"メッセージ: {printer.message}")
-    for m in printer.markers:
-        if m.level >= 0:
-            filled = round(m.level / 10)
-            lines.append(f"`{'█' * filled}{'░' * (10 - filled)}` {m.level:3d}%  {m.name}")
     return "\n".join(lines)
 
 
