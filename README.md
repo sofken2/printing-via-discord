@@ -1,17 +1,31 @@
 # printing-via-discord
 
-Discord に PDF を送るだけで、サーバー PC に USB 接続したプリンターから印刷できる常駐 Bot です。
+Discord にファイル（PDF・画像・Office 文書など）を送るだけで、サーバー PC に USB 接続したプリンターから印刷できる常駐 Bot です。
 
 - 対象環境: Debian 系 Linux / CUPS / Canon TS6730（USB、片面・カラー対応）
   - 稼働中のサーバー: **antiX 26.1（Debian 13 trixie ベース、init は runit）**
   - systemd 環境（Linux Mint / Ubuntu など）でも動きます。`install.sh` が init を自動判定します
-- 実装: Python 3.10+ / discord.py / pypdf / CUPS (`lp`)
+- 実装: Python 3.10+ / discord.py / pypdf / Pillow / LibreOffice（変換用）/ CUPS (`lp`)
 
 ## 機能
 
+### 対応ファイル
+
+| 種類 | 拡張子 | 変換方法 |
+|---|---|---|
+| PDF | `.pdf` | そのまま印刷 |
+| 画像 | `.jpg` `.jpeg` `.png` `.gif` `.bmp` `.webp` `.tif` `.tiff` | Pillow で PDF に変換（1 画像 1 ページ、用紙に合わせて拡大縮小）。TIFF は全ページ、GIF は 1 コマ目 |
+| Office 文書 | `.docx` `.doc` `.xlsx` `.xls` `.pptx` `.ppt` `.odt` `.ods` `.odp` `.rtf` | LibreOffice で PDF に変換 |
+| テキスト | `.txt` `.md` `.csv` | UTF-8 / Shift_JIS / EUC-JP を自動判別して LibreOffice で PDF に変換 |
+
+- ページ数・ページ範囲・上限枚数は、変換後の PDF で数えます
+- 変換結果はプレビューで確認できます。Office 文書はフォントの違いでレイアウトが少し崩れることがあります。正確に印刷したい場合は PDF で送ってください
+- iPhone の HEIC 画像には対応していません（Discord に送ると通常は JPEG になります）
+
+
 | コマンド | 内容 |
 |---|---|
-| `/print file:<PDF> [copies] [pages] [color]` | PDF を印刷。1ページ目のプレビューと合計枚数を表示し、ボタンで確定してから印刷します |
+| `/print file:<ファイル> [copies] [pages] [color]` | ファイルを印刷。PDF 以外は PDF に変換してから、1ページ目のプレビューと合計枚数を表示し、ボタンで確定してから印刷します |
 | `/queue` | 印刷待ちジョブ一覧 |
 | `/cancel job_id` | ジョブ取消（自分のジョブのみ。管理者は全ジョブ） |
 | `/status` | プリンター状態・待ち件数・本日の自分の利用枚数 |
@@ -36,10 +50,10 @@ Discord に PDF を送るだけで、サーバー PC に USB 接続したプリ�
 
 ### ファイルのプライバシー
 
-- `/print` のやり取り（確認画面、プレビュー、状態パネル）はすべて**本人にだけ見える**メッセージで行います。添付した PDF がチャンネルの他のメンバーに見えることはありません
+- `/print` のやり取り（確認画面、プレビュー、状態パネル）はすべて**本人にだけ見える**メッセージで行います。添付したファイルがチャンネルの他のメンバーに見えることはありません
 - 完了通知は DM で送ります。DM を受け取れない設定の場合だけチャンネルでメンションしますが、その際**ファイル名は出さず**、ジョブ ID だけを表示します
 - `/queue` では、他のメンバーのジョブはファイル名を伏せて表示します
-- サーバー PC 上の PDF は CUPS に渡した直後に削除します。CUPS のスプールにも残さないよう、下記の `PreserveJobFiles No` を設定してください
+- サーバー PC 上のファイル（元のファイル・変換後の PDF・プレビュー）は CUPS に渡した直後に削除します。CUPS のスプールにも残さないよう、下記の `PreserveJobFiles No` を設定してください
 - 注意: スラッシュコマンドで添付したファイルは Discord の CDN に一時的に保存されます。URL を知っている人は有効期限内にアクセスできますが、URL はチャンネルに表示されません
 
 ### 安全対策
@@ -48,7 +62,11 @@ Discord に PDF を送るだけで、サーバー PC に USB 接続したプリ�
 - 任意でロールによる制限ができます（`allowed_role_ids`）
 - ファイルサイズ（既定 10MB）、ページ数（既定 30）、部数（既定 5）、1 人 1 日の枚数（既定 50）に上限があります。`/print` には 10 秒のクールダウンがあります
 - PDF のマジックバイトと構造を検証し、壊れた PDF とパスワード付き PDF は拒否します
-- 受け取った PDF は CUPS に渡した直後に削除します
+- 対応していない拡張子は拒否します。Office 文書は中身が拡張子どおりの形式か（マジックバイト）を確認します
+- 画像は解像度（6000 万画素）と TIFF のページ数（50）に上限があります
+- LibreOffice の変換は 1 件ずつ、90 秒で打ち切ります。マクロは実行されません（LibreOffice の既定のマクロセキュリティ）
+- 注意: Office 文書に外部の画像などへのリンクが含まれていると、変換時に LibreOffice がそれを取りに行くことがあります。信頼できるメンバーだけが使うサーバーで運用してください
+- 受け取ったファイルは CUPS に渡した直後に削除します
 
 ## セットアップ
 
@@ -185,3 +203,5 @@ cp .env.example .env
 | プリンターが停止中になる | `sudo cupsenable TS6730` で再開。`/var/log/cups/error_log`（systemd なら `journalctl -u cups`）も確認 |
 | モノクロにならない | `lpoptions -p TS6730 -l` を見て `mono_options` を直す |
 | プレビューが出ない | `sudo apt install poppler-utils` |
+| Office 文書で「LibreOffice がない」と出る | `sudo apt install libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui` |
+| 変換した文書の日本語が文字化け・豆腐になる | `sudo apt install fonts-ipafont`（または `fonts-noto-cjk`） |

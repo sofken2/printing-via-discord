@@ -24,6 +24,11 @@ fi
 echo "init: $INIT"
 
 apt-get install -y python3-venv cups cups-client poppler-utils ipp-usb
+# PDF 以外（Office 文書・テキスト）の変換用。GUI 版の LibreOffice が既にあればそれを使う
+if ! command -v soffice >/dev/null; then
+  apt-get install -y libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui
+fi
+apt-get install -y fonts-ipafont   # 日本語の文書を変換するためのフォント
 
 id printbot &>/dev/null || useradd --system --home-dir /var/lib/printbot --shell /usr/sbin/nologin printbot
 install -d -m 0700 -o printbot -g printbot /var/lib/printbot
