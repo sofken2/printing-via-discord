@@ -14,7 +14,7 @@ from .config import Config
 from .convert import ConvertError, detect_kind, to_pdf
 from .db import Database, JobRecord
 from .ipp import (
-    JOB_ABORTED, JOB_CANCELED, JOB_PENDING, JOB_STOPPED,
+    JOB_ABORTED, JOB_CANCELED, JOB_PENDING, JOB_PROCESSING, JOB_STOPPED,
     IppClient, IppError, IppNotFound, JobStatus, PrinterStatus,
 )
 from .pdf_utils import PdfError, inspect_pdf, parse_page_ranges, render_preview
@@ -34,27 +34,201 @@ COLOR_CHOICES = [
 ]
 
 
+HELP_COOLDOWN_SEC = 30
+
+
+def help_text(cfg: Config) -> str:
+    daily = f"{cfg.daily_sheets_per_user}枚" if cfg.daily_sheets_per_user > 0 else "なし"
+    return "\n".join([
+        "## 🖨️ 印刷Botの使い方",
+        "**1. `/print` と入力して、ファイルを添付して送信**",
+        "　PDF・画像（JPEG/PNG など）・Word/Excel/PowerPoint・テキストに対応しています。",
+        "**2. 確認画面のボタンで設定**",
+        "　・部数: 一番上のメニューで選択",
+        "　・色: 「⚫ モノクロ」「🎨 カラー」ボタン（青いほうが選択中）",
+        "　・ページ: 「📄 ページ指定」で `1-3,5` のように入力（空欄で全ページ）",
+        "**3. プレビューと枚数を確認して「印刷する」**",
+        "　印刷の進み具合は画面に表示され、終わったら DM でお知らせします。",
+        "",
+        "**その他のコマンド**",
+        "`/queue` 印刷待ちの一覧　`/cancel` 自分のジョブを取り消し　`/status` プリンターの状態と本日の利用枚数",
+        "",
+        f"-# 上限: {cfg.max_file_bytes // 1024 // 1024}MB・{cfg.max_pages}ページ・{cfg.max_copies}部・"
+        f"1日 {daily}／やり取りはあなたにだけ表示されます",
+    ])
+
+
 def _safe_title(name: str) -> str:
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
     return (name or "document.pdf")[:100]
 
 
-class ConfirmView(discord.ui.View):
-    def __init__(self, owner_id: int, timeout: float):
+class PrintSetup:
+    """What the user picked on the confirmation screen, and whether it can be printed."""
+
+    def __init__(self, *, total: int, max_pages: int, copies: int, color: bool):
+        self.total = total
+        self.max_pages = max_pages
+        self.copies = copies
+        self.color = color
+        self.selection = parse_page_ranges(None, total)
+        self.page_error: Optional[str] = None
+        self.limit_error: Optional[str] = None
+
+    def set_pages(self, spec: Optional[str]) -> None:
+        try:
+            self.selection = parse_page_ranges(spec, self.total)
+            self.page_error = None
+        except PdfError as e:
+            self.page_error = f"{e}（前の指定のままです）"
+
+    @property
+    def sheets(self) -> int:
+        return self.selection.count * self.copies
+
+    @property
+    def too_many_pages(self) -> bool:
+        return self.selection.count > self.max_pages
+
+    @property
+    def first_page(self) -> int:
+        ranges = self.selection.cups_ranges
+        return int(re.match(r"\d+", ranges).group()) if ranges else 1
+
+    @property
+    def printable(self) -> bool:
+        return not self.too_many_pages and not self.limit_error
+
+    def summary(self, title: str, kind: str, printer_note: Optional[str]) -> str:
+        sel = self.selection
+        head = f"**{title}** を印刷しますか？"
+        if kind != "PDF":
+            head += f"（{kind}をPDFに変換しました）"
+        lines = [
+            head,
+            f"・ページ: **{sel.cups_ranges or '全ページ'}**（{sel.count}ページ / 全{self.total}ページ）",
+            f"・部数: **{self.copies}部**　→ 合計 **{self.sheets}枚**（片面）",
+            f"・色: **{'🎨 カラー' if self.color else '⚫ モノクロ'}**",
+        ]
+        if self.page_error:
+            lines.append(f"⚠️ {self.page_error}")
+        if self.too_many_pages:
+            lines.append(f"❌ ページ数が多すぎます（上限 {self.max_pages}ページ）。「ページ指定」で範囲を絞ってください。")
+        if self.limit_error:
+            lines.append(self.limit_error)
+        if printer_note:
+            lines.append(printer_note)
+        lines.append("-# 下のボタンで部数・色・ページを変更して、「印刷する」を押してください。")
+        return "\n".join(lines)
+
+
+class PagesModal(discord.ui.Modal, title="ページ指定"):
+    def __init__(self, view: "PrintSetupView"):
+        super().__init__(timeout=view.timeout)
+        self.setup_view = view
+        self.spec = discord.ui.TextInput(
+            label=f"印刷するページ（全{view.setup.total}ページ）",
+            placeholder="例: 1-3,5　（空欄で全ページ）",
+            default=view.setup.selection.cups_ranges or "",
+            required=False, max_length=200,
+        )
+        self.add_item(self.spec)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self.setup_view.setup.set_pages(self.spec.value)
+        await self.setup_view.refresh(interaction)
+
+
+class CopiesSelect(discord.ui.Select):
+    def __init__(self, max_copies: int, current: int):
+        super().__init__(row=0, options=[
+            discord.SelectOption(label=f"{n}部", value=str(n), default=n == current)
+            for n in range(1, min(max_copies, 25) + 1)
+        ])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view: PrintSetupView = self.view  # type: ignore[assignment]
+        view.setup.copies = int(self.values[0])
+        await view.refresh(interaction)
+
+
+class PrintSetupView(discord.ui.View):
+    """Confirmation screen with buttons for copies, colour and page range.
+
+    The timeout restarts on every interaction, so changing settings does not expire it.
+    """
+
+    def __init__(self, bot: "PrintBot", owner_id: int, setup: PrintSetup, *, pdf: Path,
+                 preview_png: Path, title: str, kind: str, printer_note: Optional[str], timeout: float):
         super().__init__(timeout=timeout)
-        self.owner_id = owner_id
+        self.bot, self.owner_id, self.setup = bot, owner_id, setup
+        self.pdf, self.preview_png = pdf, preview_png
+        self.title, self.kind, self.printer_note = title, kind, printer_note
         self.confirmed: Optional[bool] = None
+        self._preview_page: Optional[int] = None
+        self._has_preview = False
+        self.copies_select = CopiesSelect(bot.config.max_copies, setup.copies)
+        self.add_item(self.copies_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
 
-    @discord.ui.button(label="印刷する", style=discord.ButtonStyle.success)
+    def _check_limit(self) -> None:
+        self.setup.limit_error = _check_daily_limit(self.bot, self.owner_id, self.setup.sheets)
+
+    def _sync_items(self) -> None:
+        for opt in self.copies_select.options:
+            opt.default = opt.value == str(self.setup.copies)
+        self.mono_btn.style = discord.ButtonStyle.primary if not self.setup.color else discord.ButtonStyle.secondary
+        self.color_btn.style = discord.ButtonStyle.primary if self.setup.color else discord.ButtonStyle.secondary
+        sel = self.setup.selection
+        self.pages_btn.label = f"📄 ページ指定（{sel.cups_ranges or '全ページ'}）"[:80]
+        self.ok.disabled = not self.setup.printable
+
+    async def _attachments(self) -> Optional[list[discord.File]]:
+        """New preview if the first page changed, otherwise None (keep the current one)."""
+        page = self.setup.first_page
+        if page == self._preview_page:
+            return None
+        self._preview_page = page
+        preview = await render_preview(self.pdf, page, self.preview_png)
+        self._has_preview = preview is not None
+        return [discord.File(preview, filename="preview.png")] if preview else []
+
+    async def render(self) -> dict:
+        self._check_limit()
+        self._sync_items()
+        kwargs: dict = {"content": self.setup.summary(self.title, self.kind, self.printer_note), "view": self}
+        files = await self._attachments()
+        if files is not None:
+            kwargs["attachments"] = files
+        return kwargs
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()  # rendering a preview can take >3s on big files
+        await interaction.edit_original_response(**await self.render())
+
+    @discord.ui.button(label="⚫ モノクロ", row=1)
+    async def mono_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.setup.color = False
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="🎨 カラー", row=1)
+    async def color_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.setup.color = True
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="📄 ページ指定", style=discord.ButtonStyle.secondary, row=2)
+    async def pages_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_modal(PagesModal(self))
+
+    @discord.ui.button(label="印刷する", style=discord.ButtonStyle.success, row=3)
     async def ok(self, interaction: discord.Interaction, _: discord.ui.Button):
         self.confirmed = True
         await interaction.response.edit_message(content="⏳ 送信中…", view=None, attachments=[])
         self.stop()
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, row=3)
     async def ng(self, interaction: discord.Interaction, _: discord.ui.Button):
         self.confirmed = False
         await interaction.response.edit_message(content="キャンセルしました。", view=None, attachments=[])
@@ -92,8 +266,12 @@ class PrintBot(discord.Client):
     def __init__(self, config: Config):
         intents = discord.Intents.none()
         intents.guilds = True
+        # Lets the bot see messages that @mention it (for the help reply). This is not the
+        # privileged Message Content intent: Discord still sends the content of mentions.
+        intents.guild_messages = True
         super().__init__(intents=intents)
         self.config = config
+        self._help_replied: dict[int, float] = {}
         self.tree = GuardedTree(self)
         self.cups = Cups(config.printer, config.extra_options)
         self.ipp = IppClient(config.printer, config.cups_server)
@@ -120,6 +298,24 @@ class PrintBot(discord.Client):
         log.info("logged in as %s", self.user)
         for g in self.guilds:
             await self._leave_if_foreign(g)
+
+    async def on_message(self, message: discord.Message) -> None:
+        """Reply with the help text when someone @mentions the bot in the configured server."""
+        if (message.author.bot or message.guild is None or message.guild.id != self.config.guild_id
+                or self.user is None or self.user not in message.mentions):
+            return
+        now = time.monotonic()
+        if now - self._help_replied.get(message.author.id, -HELP_COOLDOWN_SEC) < HELP_COOLDOWN_SEC:
+            return  # do not let one person flood the channel
+        self._help_replied[message.author.id] = now
+        try:
+            try:
+                await message.reply(help_text(self.config), mention_author=False, silent=True)
+            except discord.Forbidden:
+                # replying needs "Read Message History"; fall back to a plain message
+                await message.channel.send(help_text(self.config), silent=True)
+        except discord.HTTPException as e:
+            log.info("could not send help reply: %s", e)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._leave_if_foreign(guild)
@@ -270,6 +466,9 @@ def format_panel(rec: JobRecord, status: Optional[JobStatus], printer: Optional[
         f"🖨️ **{rec.file_name}**（ジョブ `{rec.cups_job_id}` / {rec.sheets}枚）",
         f"状態: **{label}**",
     ]
+    progress = format_progress(rec, status)
+    if progress:
+        lines.append(progress)
     if status and status.message:
         lines.append(f"詳細: {status.message}")
     if printer and printer.problems():
@@ -277,6 +476,15 @@ def format_panel(rec: JobRecord, status: Optional[JobStatus], printer: Optional[
     if status is None or not status.final:
         lines.append(f"最終更新: <t:{int(time.time())}:T>（結果はDMでもお知らせします）")
     return "\n".join(lines)
+
+
+def format_progress(rec: JobRecord, status: Optional[JobStatus]) -> Optional[str]:
+    """"進捗: ▓▓▓░░░ 3 / 10枚" while the job is printing (only if CUPS reports a count)."""
+    if status is None or status.state != JOB_PROCESSING or rec.sheets < 2 or status.impressions < 1:
+        return None
+    done = min(status.impressions, rec.sheets)
+    filled = round(done / rec.sheets * 10)
+    return f"進捗: `{'▓' * filled}{'░' * (10 - filled)}` **{done} / {rec.sheets}枚**"
 
 
 def format_printer(printer: PrinterStatus) -> str:
@@ -321,7 +529,6 @@ def _register_commands(bot: PrintBot) -> None:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
 
-        is_color = color is not None and color.value == "color"
         work = cfg.work_dir / uuid.uuid4().hex
         work.mkdir(mode=0o700)
         png_path = work / "preview.png"
@@ -334,41 +541,29 @@ def _register_commands(bot: PrintBot) -> None:
                 converted = await to_pdf(src, file.filename, work, cfg.work_dir / ".libreoffice")
                 pdf_path = converted.pdf
                 total = await asyncio.to_thread(inspect_pdf, pdf_path)
-                selection = parse_page_ranges(pages, total)
             except PdfError as e:
                 await interaction.edit_original_response(content=f"❌ {e}")
                 return
-            if selection.count > cfg.max_pages:
-                await interaction.edit_original_response(content=
-                    f"❌ ページ数が多すぎます（{selection.count}ページ / 上限 {cfg.max_pages}ページ）。"
-                    "ページ範囲を指定してください。")
-                return
 
-            sheets = selection.count * copies
-            limit_msg = _check_daily_limit(bot, interaction.user.id, sheets)
-            if limit_msg:
-                await interaction.edit_original_response(content=limit_msg)
-                return
+            # The command options only set the starting values; everything can be changed with buttons.
+            setup = PrintSetup(total=total, max_pages=cfg.max_pages, copies=copies,
+                               color=color is not None and color.value == "color")
+            if pages:
+                setup.set_pages(pages)
 
-            first_page = int(re.match(r"\d+", selection.cups_ranges).group()) if selection.cups_ranges else 1
-            preview = await render_preview(pdf_path, first_page, png_path)
             printer = await bot.printer_status()
-
-            lines = [
-                f"**{_safe_title(file.filename)}** を印刷しますか？",
-                f"・ページ: {selection.cups_ranges or '全ページ'}（{selection.count}ページ / 全{total}ページ）",
-                f"・部数: {copies}　→ 合計 **{sheets}枚**（片面）",
-                f"・{'カラー' if is_color else 'モノクロ'}",
-            ]
+            printer_note = None
             if printer is None:
-                lines.append("⚠️ プリンターの状態を取得できませんでした。")
+                printer_note = "⚠️ プリンターの状態を取得できませんでした。"
             elif not printer.usable or printer.problems():
                 problems = "、".join(printer.problems()) or "停止中"
-                lines.append(f"⚠️ プリンター: {problems}。印刷はプリンター復帰後になります。")
-            view = ConfirmView(interaction.user.id, timeout=cfg.confirm_timeout_sec)
-            attachments = [discord.File(preview, filename="preview.png")] if preview else []
-            await interaction.edit_original_response(
-                content="\n".join(lines), view=view, attachments=attachments)
+                printer_note = f"⚠️ プリンター: {problems}。印刷はプリンター復帰後になります。"
+
+            title = _safe_title(file.filename)
+            view = PrintSetupView(bot, interaction.user.id, setup, pdf=pdf_path, preview_png=png_path,
+                                  title=title, kind=converted.kind, printer_note=printer_note,
+                                  timeout=cfg.confirm_timeout_sec)
+            await interaction.edit_original_response(**await view.render())
 
             if await view.wait():  # timed out
                 await interaction.edit_original_response(
@@ -377,6 +572,7 @@ def _register_commands(bot: PrintBot) -> None:
             if not view.confirmed:
                 return
 
+            selection, copies, is_color, sheets = setup.selection, setup.copies, setup.color, setup.sheets
             async with bot.submit_lock:
                 limit_msg = _check_daily_limit(bot, interaction.user.id, sheets)
                 if limit_msg:
@@ -388,7 +584,7 @@ def _register_commands(bot: PrintBot) -> None:
                         copies=copies,
                         page_ranges=selection.cups_ranges,
                         options=cfg.color_options if is_color else cfg.mono_options,
-                        title=_safe_title(file.filename),
+                        title=title,
                     )
                 except PrintError as e:
                     log.error("submit failed: %s", e)
@@ -397,7 +593,7 @@ def _register_commands(bot: PrintBot) -> None:
                 bot.db.add_job(
                     cups_job_id=job_id, user_id=interaction.user.id,
                     user_name=str(interaction.user), channel_id=interaction.channel_id,
-                    file_name=_safe_title(file.filename), pages=selection.count,
+                    file_name=title, pages=selection.count,
                     copies=copies, color=is_color,
                 )
             log.info("job %s submitted by %s (%d sheets)", job_id, interaction.user, sheets)
@@ -435,6 +631,10 @@ def _register_commands(bot: PrintBot) -> None:
                 who = "Bot外のジョブ"
             lines.append(f"・`{j.job_id}` {state} — {who}")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @tree.command(name="help", description="使い方とコマンドの説明を表示します", guild=guild)
+    async def help_cmd(interaction: discord.Interaction):
+        await interaction.response.send_message(help_text(cfg), ephemeral=True)
 
     @tree.command(name="cancel", description="印刷ジョブを取り消します", guild=guild)
     @app_commands.describe(job_id="ジョブID（/queue で確認できます）")

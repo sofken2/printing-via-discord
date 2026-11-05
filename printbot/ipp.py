@@ -88,6 +88,8 @@ class JobStatus:
     state: int
     reasons: tuple[str, ...] = ()
     message: str = ""
+    # pages CUPS has finished so far (job-impressions-completed), counting every copy
+    impressions: int = 0
 
     @property
     def final(self) -> bool:
@@ -264,12 +266,14 @@ class IppClient:
             (TAG_INTEGER, "job-id", job_id),
             (TAG_NAME, "requesting-user-name", self.user),
             (TAG_KEYWORD, "requested-attributes",
-             ["job-state", "job-state-reasons", "job-printer-state-message"]),
+             ["job-state", "job-state-reasons", "job-printer-state-message",
+              "job-impressions-completed"]),
         ])
         return JobStatus(
             state=a.get("job-state", [0])[0],
             reasons=tuple(a.get("job-state-reasons", [])),
             message=a.get("job-printer-state-message", [""])[0],
+            impressions=a.get("job-impressions-completed", [0])[0],
         )
 
     def _printer(self) -> PrinterStatus:
