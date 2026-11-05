@@ -40,7 +40,7 @@ def help_text(cfg: Config) -> str:
         "　PDF・画像（JPEG/PNG など）・Word/Excel/PowerPoint・テキストに対応しています。",
         "**2. 確認画面のボタンで設定**",
         "　・部数: 一番上のメニューで選択",
-        "　・色: 「⚫ モノクロ」「🎨 カラー」ボタン（青いほうが選択中）",
+        "　・色: 「🎨 カラー」「⚫ モノクロ」ボタン（青いほうが選択中。最初はカラー）",
         "　・ページ: 「📄 ページ指定」で `1-3,5` のように入力（空欄で全ページ）",
         "**3. プレビューと枚数を確認して「印刷する」**",
         "　印刷の進み具合は画面に表示され、終わったら DM でお知らせします。",
@@ -534,7 +534,7 @@ def _register_commands(bot: PrintBot) -> None:
                 return
 
             # Copies, colour and pages are chosen with the buttons on the confirmation screen.
-            setup = PrintSetup(total=total, max_pages=cfg.max_pages, copies=1, color=False)
+            setup = PrintSetup(total=total, max_pages=cfg.max_pages, copies=1, color=True)
 
             printer = await bot.printer_status()
             printer_note = None
